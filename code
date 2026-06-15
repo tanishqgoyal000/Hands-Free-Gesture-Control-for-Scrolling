@@ -1,0 +1,287 @@
+"""
+Phase 2: Double-Blink / Eye-Widen Gesture Control
+---------------------------------------------------------------
+- Double blink (both eyes) within a short window -> SCROLL UP
+- Eye widening (both eyes) -> SCROLL DOWN
+
+Logic:
+- Track average EAR (Eye Aspect Ratio) across both eyes
+- Calibrate a baseline EAR (both eyes open, relaxed)
+- BLINK = EAR drops well below baseline, then recovers (one blink event)
+- DOUBLE BLINK = two blink events within DOUBLE_BLINK_WINDOW seconds -> scroll up
+- WIDEN = EAR goes well above baseline and is held -> scroll down
+
+SETUP (run once before first use):
+  pip install mediapipe opencv-python pyautogui --break-system-packages
+
+  Download the face landmarker model (one-time, ~5MB):
+  curl -L -o face_landmarker.task \
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+  Place face_landmarker.task in the SAME folder as this script.
+
+Controls:
+  - Press 'c' to calibrate (look normal, both eyes open, hold for ~2 sec)
+  - Press 'q' to quit
+"""
+
+import cv2
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+import numpy as np
+import time
+import os
+
+# ----------------------------
+# Config
+# ----------------------------
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+
+# Blink detection
+BLINK_CLOSE_RATIO = 0.6        # EAR must drop below 60% of baseline to count as "eye closed"
+BLINK_OPEN_RATIO = 0.85        # EAR must recover above 85% of baseline to count as "eye open again"
+DOUBLE_BLINK_WINDOW = 0.9      # seconds: max time between two blinks to count as "double blink"
+
+# Widen detection
+WIDEN_RATIO = 1.25             # EAR must exceed 125% of baseline
+WIDEN_HOLD_FRAMES = 3          # consecutive frames above widen threshold to confirm
+
+COOLDOWN_SECONDS = 1.0         # min time between any two triggers
+CALIBRATION_SECONDS = 2.0
+ENABLE_SCROLL_ACTION = True   # set True to actually scroll (needs pyautogui)
+
+if ENABLE_SCROLL_ACTION:
+    import pyautogui
+
+# FaceLandmarker (478-point face mesh) eye landmark indices
+LEFT_EYE = {"top": 159, "bottom": 145, "left": 33, "right": 133}
+RIGHT_EYE = {"top": 386, "bottom": 374, "left": 362, "right": 263}
+
+
+def euclidean(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
+
+
+def eye_aspect_ratio(landmarks, eye_points, frame_w, frame_h):
+    """Compute EAR = vertical eye opening / horizontal eye width."""
+    def get_xy(idx):
+        lm = landmarks[idx]
+        return (lm.x * frame_w, lm.y * frame_h)
+
+    top = get_xy(eye_points["top"])
+    bottom = get_xy(eye_points["bottom"])
+    left = get_xy(eye_points["left"])
+    right = get_xy(eye_points["right"])
+
+    vertical = euclidean(top, bottom)
+    horizontal = euclidean(left, right)
+
+    if horizontal == 0:
+        return 0.0
+    return vertical / horizontal
+
+
+def do_scroll_up():
+    if ENABLE_SCROLL_ACTION:
+        pyautogui.scroll(50)
+    print(f"[{time.strftime('%H:%M:%S')}] DOUBLE BLINK -> SCROLL UP")
+
+
+def do_scroll_down():
+    if ENABLE_SCROLL_ACTION:
+        pyautogui.scroll(-50)
+    print(f"[{time.strftime('%H:%M:%S')}] WIDEN -> SCROLL DOWN")
+
+
+def main():
+    if not os.path.exists(MODEL_PATH):
+        print(f"ERROR: Model file not found at {MODEL_PATH}")
+        print("Download it first with:")
+        print('  curl -L -o face_landmarker.task '
+              '"https://storage.googleapis.com/mediapipe-models/face_landmarker/'
+              'face_landmarker/float16/1/face_landmarker.task"')
+        return
+
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_faces=1,
+    )
+    landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam. Check camera permissions/index.")
+        return
+
+    baseline_ear = None
+    calibrating = False
+    calib_start_time = None
+    calib_samples = []
+
+    # Blink state machine
+    eye_is_closed = False
+    last_blink_time = 0.0          # time of the most recently COMPLETED blink
+    pending_first_blink = False    # waiting to see if a 2nd blink follows
+
+    # Widen state
+    widen_counter = 0
+
+    last_trigger_time = 0.0
+
+    print("Press 'c' to calibrate (both eyes open, relaxed, hold for 2 sec).")
+    print("Press 'q' to quit.")
+
+    start_time = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read frame from webcam.")
+            break
+
+        frame = cv2.flip(frame, 1)  # mirror view
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        timestamp_ms = int((time.time() - start_time) * 1000)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        current_ear = None
+
+        if result.face_landmarks:
+            landmarks = result.face_landmarks[0]
+
+            left_ear = eye_aspect_ratio(landmarks, LEFT_EYE, w, h)
+            right_ear = eye_aspect_ratio(landmarks, RIGHT_EYE, w, h)
+            current_ear = (left_ear + right_ear) / 2.0
+
+            for eye_points in (LEFT_EYE, RIGHT_EYE):
+                for key in ("top", "bottom", "left", "right"):
+                    idx = eye_points[key]
+                    lm = landmarks[idx]
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 2, (0, 255, 0), -1)
+
+        # ----------------------------
+        # Calibration handling
+        # ----------------------------
+        if calibrating and current_ear is not None:
+            calib_samples.append(current_ear)
+            elapsed = time.time() - calib_start_time
+            cv2.putText(frame, f"Calibrating... {elapsed:.1f}s", (10, 60),
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            if elapsed >= CALIBRATION_SECONDS:
+                baseline_ear = float(np.mean(calib_samples))
+                calibrating = False
+                calib_samples = []
+                # reset gesture state on recalibration
+                eye_is_closed = False
+                pending_first_blink = False
+                widen_counter = 0
+                print(f"Baseline EAR set to: {baseline_ear:.4f}")
+
+        # ----------------------------
+        # Gesture detection
+        # ----------------------------
+        triggered_action = None
+
+        if baseline_ear is not None and current_ear is not None and not calibrating:
+            close_thresh = baseline_ear * BLINK_CLOSE_RATIO
+            open_thresh = baseline_ear * BLINK_OPEN_RATIO
+            widen_thresh = baseline_ear * WIDEN_RATIO
+
+            now = time.time()
+
+            # --- Blink state machine ---
+            if not eye_is_closed and current_ear < close_thresh:
+                eye_is_closed = True  # eye just closed
+
+            elif eye_is_closed and current_ear > open_thresh:
+                # eye just reopened -> one full blink completed
+                eye_is_closed = False
+
+                if pending_first_blink and (now - last_blink_time) <= DOUBLE_BLINK_WINDOW:
+                    # second blink within window -> double blink!
+                    if (now - last_trigger_time) > COOLDOWN_SECONDS:
+                        triggered_action = "UP"
+                        last_trigger_time = now
+                        do_scroll_up()
+                    pending_first_blink = False
+                else:
+                    # this is the first blink of a potential pair
+                    pending_first_blink = True
+                    last_blink_time = now
+
+            # expire a stale "pending first blink" if window passed
+            if pending_first_blink and (now - last_blink_time) > DOUBLE_BLINK_WINDOW:
+                pending_first_blink = False
+
+            # --- Widen detection (only matters when eyes are open) ---
+            if not eye_is_closed:
+                if current_ear > widen_thresh:
+                    widen_counter += 1
+                else:
+                    widen_counter = 0
+
+                if (widen_counter >= WIDEN_HOLD_FRAMES
+                        and (now - last_trigger_time) > COOLDOWN_SECONDS):
+                    triggered_action = "DOWN"
+                    last_trigger_time = now
+                    widen_counter = 0
+                    # also cancel any pending double-blink state to avoid weirdness
+                    pending_first_blink = False
+                    do_scroll_down()
+            else:
+                widen_counter = 0
+
+        # ----------------------------
+        # On-screen overlay
+        # ----------------------------
+        if current_ear is not None:
+            cv2.putText(frame, f"EAR: {current_ear:.4f}", (10, 30),
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        if baseline_ear is not None:
+            cv2.putText(frame, f"Baseline: {baseline_ear:.4f}", (10, 90),
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+            cv2.putText(frame, f"Close <{baseline_ear*BLINK_CLOSE_RATIO:.3f} | "
+                                 f"Widen >{baseline_ear*WIDEN_RATIO:.3f}",
+                         (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+            if pending_first_blink:
+                cv2.putText(frame, "1st blink detected... blink again!", (10, 150),
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        else:
+            cv2.putText(frame, "No baseline - press 'c' to calibrate", (10, 90),
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        if triggered_action == "UP":
+            cv2.putText(frame, "DOUBLE BLINK -> SCROLL UP", (10, 190),
+                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        elif triggered_action == "DOWN":
+            cv2.putText(frame, "WIDEN -> SCROLL DOWN", (10, 190),
+                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+        cv2.imshow("Double-Blink / Widen Control", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('c'):
+            calibrating = True
+            calib_start_time = time.time()
+            calib_samples = []
+            eye_is_closed = False
+            pending_first_blink = False
+            widen_counter = 0
+            print("Calibration started... keep both eyes open, relaxed expression.")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
